@@ -1,0 +1,276 @@
+x86/tdx: take a guest's private pages out of the kernel direct map
+
+SPDX-License-Identifier: GPL-2.0-only
+
+Written against Ubuntu linux 7.0.0-43.43 (resolute), which is upstream v7.0
+plus Ubuntu's changes. Apply with "patch -p1" in the top of that tree.
+
+A page that TDH.MEM.PAGE.ADD or TDH.MEM.PAGE.AUG has given to a TDX guest is
+still mapped writable in the host kernel's direct map. A host store through
+that mapping lands with the host's key and clears the TD-owner bit of the
+64-byte line. The guest's next read of the line is a machine check.
+
+With this patch the host kernel has no mapping of such a page while a guest
+owns it:
+
+  - guest_memfd splits the direct map around the page to 4K before the page
+    is handed to KVM. The split can allocate and sleep, so it is done there
+    and not under mmu_lock.
+  - After ADD or AUG returns success, the page's cache lines are flushed once
+    more, its 4K direct-map entry is cleared, and the kernel TLB is flushed
+    on every CPU. The flush has to come first: CLFLUSHOPT faults on a page
+    that is not mapped. A failed SEAMCALL leaves the page mapped.
+  - Secure EPT pages, TD control pages and the ADD source page stay mapped.
+  - When the page is removed from the guest, the entry is put back after
+    TDH.PHYMEM.PAGE.WBINVD succeeds and before tdx_quirk_reset_page(), which
+    writes through the direct map.
+  - /proc/tdx_direct_map counts each change: hide_ok, hide_fail,
+    unshield_ok, unshield_fail.
+
+KVM is a module, so set_memory_4k(), set_direct_map_invalid_noflush(),
+set_direct_map_default_noflush() and flush_tlb_kernel_range() are exported.
+
+--- a/arch/x86/mm/pat/set_memory.c
++++ b/arch/x86/mm/pat/set_memory.c
+@@ -2402,6 +2402,7 @@
+ 					__pgprot(_PAGE_KERNEL_4K),
+ 					__pgprot(0), 1, 0, NULL);
+ }
++EXPORT_SYMBOL_GPL(set_memory_4k);
+ 
+ int set_memory_nonglobal(unsigned long addr, int numpages)
+ {
+@@ -2688,11 +2689,13 @@
+ {
+ 	return __set_pages_np(page, 1, 0);
+ }
++EXPORT_SYMBOL_GPL(set_direct_map_invalid_noflush);
+ 
+ int set_direct_map_default_noflush(struct page *page)
+ {
+ 	return __set_pages_p(page, 1, 0);
+ }
++EXPORT_SYMBOL_GPL(set_direct_map_default_noflush);
+ 
+ int set_direct_map_valid_noflush(struct page *page, unsigned nr, bool valid)
+ {
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@ -1562,6 +1562,7 @@
+ 
+ 	put_flush_tlb_info();
+ }
++EXPORT_SYMBOL_GPL(flush_tlb_kernel_range);
+ 
+ /*
+  * This can be used from process context to figure out what the value of
+--- a/virt/kvm/guest_memfd.c
++++ b/virt/kvm/guest_memfd.c
+@@ -7,6 +7,7 @@
+ #include <linux/mempolicy.h>
+ #include <linux/pseudo_fs.h>
+ #include <linux/pagemap.h>
++#include <linux/set_memory.h>
+ 
+ #include "kvm_mm.h"
+ 
+@@ -814,12 +815,22 @@
+ 
+ 	folio_unlock(folio);
+ 
+-	if (!r)
+-		*page = folio_file_page(folio, index);
+-	else
++	if (r) {
+ 		folio_put(folio);
++		return r;
++	}
+ 
+-	return r;
++	*page = folio_file_page(folio, index);
++	/*
++	 * Split while this can sleep. tdx_mem_page_aug() runs under the
++	 * non-sleeping mmu_lock and must not split a large direct map.
++	 */
++	if (set_memory_4k((unsigned long)page_address(*page), 1)) {
++		folio_put(folio);
++		return -ENOMEM;
++	}
++
++	return 0;
+ }
+ EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_gmem_get_pfn);
+ 
+@@ -851,6 +862,11 @@
+ 		goto out_put_folio;
+ 	}
+ 
++	if (set_memory_4k((unsigned long)page_address(pfn_to_page(pfn)), 1)) {
++		ret = -ENOMEM;
++		goto out_put_folio;
++	}
++
+ 	ret = post_populate(kvm, gfn, pfn, src_page, opaque);
+ 	if (!ret)
+ 		folio_mark_uptodate(folio);
+--- a/arch/x86/include/asm/tdx.h
++++ b/arch/x86/include/asm/tdx.h
+@@ -155,6 +155,7 @@
+ void tdx_guest_keyid_free(unsigned int keyid);
+ 
+ void tdx_quirk_reset_page(struct page *page);
++int tdx_unshield_private_page(struct page *page);
+ 
+ struct tdx_td {
+ 	/* TD root structure: */
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -1830,6 +1830,14 @@
+ 
+ 	err = tdh_phymem_page_wbinvd_hkid((u16)kvm_tdx->hkid, page);
+ 	if (TDX_BUG_ON(err, TDH_PHYMEM_PAGE_WBINVD, kvm))
++		return;
++
++	/*
++	 * The page is no longer private. Put the direct map back before
++	 * the reset helper, which uses that map. A failed write-back
++	 * returned above and left the page unmapped.
++	 */
++	if (tdx_unshield_private_page(page))
+ 		return;
+ 
+ 	tdx_quirk_reset_page(page);
+--- a/arch/x86/virt/vmx/tdx/tdx.c
++++ b/arch/x86/virt/vmx/tdx/tdx.c
+@@ -30,6 +30,10 @@
+ #include <linux/suspend.h>
+ #include <linux/idr.h>
+ #include <linux/kvm_types.h>
++#include <linux/atomic.h>
++#include <linux/proc_fs.h>
++#include <linux/seq_file.h>
++#include <linux/set_memory.h>
+ #include <asm/page.h>
+ #include <asm/special_insns.h>
+ #include <asm/msr-index.h>
+@@ -38,6 +42,8 @@
+ #include <asm/tdx.h>
+ #include <asm/cpu_device_id.h>
+ #include <asm/processor.h>
++#include <asm/pgtable.h>
++#include <asm/tlbflush.h>
+ #include <asm/mce.h>
+ #include "tdx.h"
+ 
+@@ -1516,6 +1522,93 @@
+ 	clflush_cache_range(page_to_virt(page), PAGE_SIZE);
+ }
+ 
++/*
++ * Call only after TDH.MEM.PAGE.ADD or AUG has succeeded, and only for
++ * that guest page. CLFLUSHOPT is a load and page-faults when the direct
++ * map is not present, so the flush stays above the unmap. The 4K split
++ * already happened on a sleepable path. This runs under mmu_lock and
++ * must not allocate.
++ */
++static atomic64_t tdx_hide_ok;
++static atomic64_t tdx_hide_fail;
++static atomic64_t tdx_unshield_ok;
++static atomic64_t tdx_unshield_fail;
++
++static bool tdx_direct_leaf_is_4k(unsigned long addr)
++{
++	unsigned int level;
++	pte_t *pte;
++
++	if (!addr)
++		return false;
++	pte = lookup_address(addr, &level);
++	return pte && level == PG_LEVEL_4K;
++}
++
++static void tdx_hide_private_page(struct page *page)
++{
++	unsigned long addr = (unsigned long)page_address(page);
++
++	tdx_clflush_page(page);
++	if (!tdx_direct_leaf_is_4k(addr)) {
++		atomic64_inc(&tdx_hide_fail);
++		return;
++	}
++	if (set_direct_map_invalid_noflush(page)) {
++		atomic64_inc(&tdx_hide_fail);
++		return;
++	}
++	flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
++	atomic64_inc(&tdx_hide_ok);
++}
++
++int tdx_unshield_private_page(struct page *page)
++{
++	unsigned long addr = (unsigned long)page_address(page);
++	int r;
++
++	if (!tdx_direct_leaf_is_4k(addr)) {
++		atomic64_inc(&tdx_unshield_fail);
++		return -EINVAL;
++	}
++	r = set_direct_map_default_noflush(page);
++	if (r) {
++		atomic64_inc(&tdx_unshield_fail);
++		return r;
++	}
++	flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
++	atomic64_inc(&tdx_unshield_ok);
++	return 0;
++}
++EXPORT_SYMBOL_FOR_KVM(tdx_unshield_private_page);
++
++static int tdx_direct_map_show(struct seq_file *m, void *v)
++{
++	seq_printf(m, "hide_ok %lld\nhide_fail %lld\nunshield_ok %lld\nunshield_fail %lld\n",
++		   atomic64_read(&tdx_hide_ok), atomic64_read(&tdx_hide_fail),
++		   atomic64_read(&tdx_unshield_ok), atomic64_read(&tdx_unshield_fail));
++	return 0;
++}
++
++static int tdx_direct_map_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, tdx_direct_map_show, NULL);
++}
++
++static const struct proc_ops tdx_direct_map_ops = {
++	.proc_open = tdx_direct_map_open,
++	.proc_read = seq_read,
++	.proc_lseek = seq_lseek,
++	.proc_release = single_release,
++};
++
++static int __init tdx_direct_map_proc(void)
++{
++	proc_create("tdx_direct_map", 0444, NULL, &tdx_direct_map_ops);
++	return 0;
++}
++late_initcall(tdx_direct_map_proc);
++
+ noinstr u64 tdh_vp_enter(struct tdx_vp *td, struct tdx_module_args *args)
+ {
+ 	args->rcx = td->tdvpr_pa;
+@@ -1548,6 +1641,8 @@
+ 
+ 	tdx_clflush_page(page);
+ 	ret = seamcall_ret(TDH_MEM_PAGE_ADD, &args);
++	if (!ret)
++		tdx_hide_private_page(page);
+ 
+ 	*ext_err1 = args.rcx;
+ 	*ext_err2 = args.rdx;
+@@ -1598,6 +1693,8 @@
+ 
+ 	tdx_clflush_page(page);
+ 	ret = seamcall_ret(TDH_MEM_PAGE_AUG, &args);
++	if (!ret)
++		tdx_hide_private_page(page);
+ 
+ 	*ext_err1 = args.rcx;
+ 	*ext_err2 = args.rdx;

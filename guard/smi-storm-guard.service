@@ -1,0 +1,18 @@
+[Unit]
+Description=Pause the TDX guest that drives an SMI storm
+ConditionPathExists=/usr/local/sbin/smi-storm-guard
+
+[Service]
+Type=simple
+ExecStartPre=/sbin/modprobe msr
+ExecStart=/usr/bin/python3 /usr/local/sbin/smi-storm-guard
+Restart=always
+RestartSec=2
+# It has to keep running while every guest is stalled.
+Nice=-15
+OOMScoreAdjust=-900
+# Settings go here, one per line. See the README.
+#Environment=GUARD_ARGS=tdx-guest
+
+[Install]
+WantedBy=multi-user.target
